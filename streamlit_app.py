@@ -1,151 +1,118 @@
+# streamlit_app.py (ES)
+from __future__ import annotations
 import streamlit as st
 import pandas as pd
-import math
-from pathlib import Path
+from datetime import date
+from db import init_db, seed_tanks, get_all_tanks, get_movements, create_movement
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
+# ----- Inicialización DB -----
+init_db()
+# Si ya sembraste los 30 tanques, puedes comentar la siguiente línea.
+seed_tanks([f"TNK-{i:03d}" for i in range(1, 31)])
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+st.set_page_config(page_title="Seguimiento de Tanques de Nitrógeno", layout="wide")
+st.title("🌡️ Seguimiento de Tanques de Nitrógeno")
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+# Mapeos UI (ES) -> valores internos (EN)
+MOVIMIENTO_UI = ["Despacho", "Recepción"]
+MOVIMIENTO_MAP = {"Despacho": "dispatch", "Recepción": "receipt"}
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
+# Pestañas
+tabs = st.tabs(["📦 Tanques", "✈️ Nuevo Movimiento", "📜 Bitácora", "📊 Reportes"])
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
+# ---------- Pestaña: Tanques ----------
+with tabs[0]:
+    st.header("Inventario de tanques")
+    tanks = get_all_tanks()
+    df = pd.DataFrame([{
+        "Serie": t.serial,
+        "Estado": "fuera" if t.status == "out" else "en almacén",
+        "Último movimiento": t.last_movement_date
+    } for t in tanks])
+    if not df.empty and "Último movimiento" in df.columns:
+        df["Último movimiento"] = pd.to_datetime(df["Último movimiento"])
+    st.dataframe(df, use_container_width=True)
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+# ---------- Pestaña: Nuevo Movimiento ----------
+with tabs[1]:
+    st.header("Registrar movimiento")
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
+    tanks = get_all_tanks()
+    seriales = [t.serial for t in tanks]
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+    col1, col2 = st.columns(2)
+    with col1:
+        serial = st.selectbox("Serie del tanque", seriales, placeholder="TNK-001")
+        movimiento_ui = st.radio("Tipo de movimiento", MOVIMIENTO_UI, horizontal=True)
+        movimiento_tipo = MOVIMIENTO_MAP[movimiento_ui]
+        fecha_mov = st.date_input("Fecha del movimiento", date.today(), max_value=date.today())
+    with col2:
+        proyecto = st.text_input("Proyecto (obligatorio en despacho)", placeholder="Proyecto Atlas")
+        ingeniero = st.text_input("Ingeniero responsable (obligatorio en despacho)", placeholder="Jane Doe")
 
-    return gdp_df
+    if st.button("Guardar movimiento", type="primary"):
+        try:
+            mov = create_movement(
+                serial=serial,
+                movement_type=movimiento_tipo,
+                movement_date=fecha_mov,
+                project=proyecto or None,
+                engineer=ingeniero or None
+            )
+            st.success(f"Movimiento registrado: {serial} — {movimiento_ui.lower()} — {fecha_mov.isoformat()}")
+        except Exception as e:
+            st.error(str(e))
 
-gdp_df = get_gdp_data()
+# ---------- Pestaña: Bitácora ----------
+with tabs[2]:
+    st.header("Bitácora de movimientos")
 
-# -----------------------------------------------------------------------------
-# Draw the actual page
+    tanks = get_all_tanks()
+    filtro_serial = st.selectbox("Filtrar por tanque", ["Todos"] + [t.serial for t in tanks])
 
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
+    movimientos = get_movements(None if filtro_serial == "Todos" else filtro_serial)
+    df = pd.DataFrame([{
+        "ID": m.id,
+        "Serie": m.serial,
+        "Tipo": "Despacho" if m.movement_type == "dispatch" else "Recepción",
+        "Fecha": m.movement_date,
+        "Proyecto": m.project,
+        "Ingeniero": m.responsible_engineer,
+        "Creado": m.created_at,
+    } for m in movimientos])
 
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
+    if not df.empty:
+        for c in ["Fecha", "Creado"]:
+            if c in df.columns:
+                df[c] = pd.to_datetime(df[c])
+    st.dataframe(df, use_container_width=True)
 
-# Add some spacing
-''
-''
+# ---------- Pestaña: Reportes ----------
+with tabs[3]:
+    st.header("Reportes")
 
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
+    # Actualmente fuera
+    st.subheader("Tanques actualmente fuera")
+    tanks = get_all_tanks()
+    fuera = [t for t in tanks if t.status == "out"]
+    df_out = pd.DataFrame([{
+        "Serie": t.serial,
+        "Estado": "fuera",
+        "Desde": t.last_movement_date
+    } for t in fuera])
+    if not df_out.empty and "Desde" in df_out.columns:
+        df_out["Desde"] = pd.to_datetime(df_out["Desde"])
+    st.dataframe(df_out, use_container_width=True)
 
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+    # Conteo de movimientos por tanque
+    st.subheader("Conteo de movimientos por tanque")
+    movimientos = get_movements()
+    df_mov = pd.DataFrame([{
+        "Serie": m.serial,
+        "Tipo": "Despacho" if m.movement_type == "dispatch" else "Recepción"
+    } for m in movimientos])
+    if not df_mov.empty:
+        conteos = df_mov.groupby(["Serie", "Tipo"]).size().unstack(fill_value=0)
+        st.dataframe(conteos, use_container_width=True)
+    else:
+        st.info("Aún no hay movimientos registrados.")
