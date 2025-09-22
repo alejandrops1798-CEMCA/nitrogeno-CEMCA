@@ -1,228 +1,183 @@
-# streamlit_app.py (ES, con Login corregido y Reportes público)
+# db.py — now supports hosted Postgres via DATABASE_URL (st.secrets or env)
 from __future__ import annotations
-import streamlit as st
-import pandas as pd
-from datetime import date
-from db import (
-    init_db,
-    seed_tanks,
-    get_all_tanks,
-    get_movements,
-    create_movement,
-    summary_current_out_by_engineer,
+from datetime import date, datetime
+import os, re
+from typing import Optional, List, Dict
+from sqlalchemy import create_engine, Column, String, Integer, Date, DateTime, ForeignKey, text
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+
+def _database_url() -> str:
+    # Prefer Streamlit Cloud secrets; fall back to env var; default to local SQLite
+    url = None
+    try:
+        import streamlit as st  # available at runtime in Streamlit
+        url = st.secrets.get("DATABASE_URL")
+    except Exception:
+        pass
+    url = url or os.getenv("DATABASE_URL")
+    return url or "sqlite:///tanks.db"
+
+DATABASE_URL = _database_url()
+
+# Important for Neon/Supabase: sslmode is typically required; include in your secret URL
+engine = create_engine(
+    DATABASE_URL,
+    echo=False,
+    future=True,
+    pool_pre_ping=True,  # keeps the pool healthy on serverless Postgres
 )
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
 
-# ========= Config =========
-VALID_USER = "inspectordespachos@grupocemca.com"
-VALID_PASS = "12345"
+# ----------------- Tablas -----------------
+class Tank(Base):
+    __tablename__ = "tanks"
+    serial = Column(String, primary_key=True)
+    status = Column(String, default="in")                 # 'in' | 'out'
+    last_movement_date = Column(Date, nullable=True)
+    movements = relationship("Movement", back_populates="tank", cascade="all, delete-orphan")
 
-MOVIMIENTO_UI = ["Despacho", "Recepción"]
-MOVIMIENTO_MAP = {"Despacho": "dispatch", "Recepción": "receipt"}
+class Movement(Base):
+    __tablename__ = "movements"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    serial = Column(String, ForeignKey("tanks.serial"), nullable=False)
+    movement_type = Column(String, nullable=False)        # 'dispatch' | 'receipt'
+    movement_date = Column(Date, nullable=False)
+    project = Column(String, nullable=True)
+    responsible_engineer = Column(String, nullable=True)
+    responsible_contractor = Column(String, nullable=True)
+    smt_number = Column(String, nullable=True)            # obligatorio (5 dígitos)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    tank = relationship("Tank", back_populates="movements")
 
-INGENIEROS = [
-    "Victor de Leon",
-    "Pablo Castillo",
-    "Roberto de Jesus",
-    "Rayner Drullard",
-    "Lenny Ramirez",
-    "Fausto Huerta",
-    "Alfredo Matos",
-    "Luilly Lima",
-    "Fantino Suarez",
-    "Jhonatan Perez",
-    "Sarah Bonilla",
-    "Julian Barcelo",
-    "Otro",
-]
+# ----------------- Setup + “migración” simple -----------------
+def init_db():
+    """Create tables if they don't exist; add new columns to old DBs (SQLite or Postgres)."""
+    Base.metadata.create_all(engine)
+    _ensure_migrations()
 
-SERIALES_PERSONALIZADOS = [
-    "AIRLIQUIDE-1","AIRLIQUIDE-2","AIRLIQUIDE-3","AIRLIQUIDE-4","AIRLIQUIDE-5",
-    "GC-TAZUL-01","GC-TAZUL-02","GC-TAZUL-03","GC-TAZUL-04","GC-TAZUL-05",
-    "GC-TAZUL-06","GC-TAZUL-07","GC-TAZUL-08","GC-TAZUL-09","GC-TAZUL-10",
-    "GC-TAZUL-11","GC-TAZUL-12","GC-TAZUL-13","GC-TAZUL-14","GC-TAZUL-15",
-    "GC-TAZUL-16","GC-TAZUL-17","GC-TAZUL-18","GC-TAZUL-19","GC-TAZUL-20",
-    "GC-TORIGINAL-01","GC-TORIGINAL-02","GC-TORIGINAL-03","GC-TORIGINAL-04","GC-TORIGINAL-05",
-]
-
-# ========= Setup página/DB =========
-st.set_page_config(page_title="Seguimiento de Tanques de Nitrógeno", layout="wide")
-st.title("🌡️ Seguimiento de Tanques de Nitrógeno")
-
-init_db()
-# (Si no quieres re-sembrar en cada arranque, comenta esta línea.)
-seed_tanks(SERIALES_PERSONALIZADOS)
-
-# ========= Estado de sesión (auth) =========
-if "auth_ok" not in st.session_state:
-    st.session_state["auth_ok"] = False
-if "auth_user" not in st.session_state:
-    st.session_state["auth_user"] = None
-
-def do_login(user: str, pwd: str) -> bool:
-    return (user.strip().lower() == VALID_USER) and (pwd == VALID_PASS)
-
-def logout():
-    st.session_state["auth_ok"] = False
-    st.session_state["auth_user"] = None
-    st.rerun()
-
-# ========= UI de Login (si no autenticado) =========
-def login_box():
-    with st.sidebar:
-        st.subheader("🔐 Acceso")
-        u = st.text_input("Usuario", placeholder="correo@empresa.com")
-        p = st.text_input("Contraseña", type="password")
-        if st.button("Iniciar sesión"):
-            if do_login(u, p):
-                st.session_state["auth_ok"] = True
-                st.session_state["auth_user"] = u.strip().lower()
-                st.success("Acceso concedido.")
-                st.rerun()
+def _ensure_migrations():
+    # Add columns to movements table if they’re missing (works on SQLite & Postgres)
+    with engine.begin() as conn:
+        def has_col(table: str, col: str) -> bool:
+            # portable check: use information_schema for Postgres; PRAGMA for SQLite
+            url = str(engine.url)
+            if url.startswith("sqlite"):
+                rows = conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
+                return any(r[1] == col for r in rows)
             else:
-                st.error("Credenciales inválidas.")
+                q = text("""
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_name = :t
+                """)
+                rows = conn.execute(q, {"t": table}).fetchall()
+                return any(r[0] == col for r in rows)
 
-# ========= Contenido de Reportes (siempre visible) =========
-def render_reportes():
-    st.header("Reportes")
+        if not has_col("movements", "responsible_contractor"):
+            conn.execute(text("ALTER TABLE movements ADD COLUMN responsible_contractor TEXT"))
+        if not has_col("movements", "smt_number"):
+            conn.execute(text("ALTER TABLE movements ADD COLUMN smt_number TEXT"))
 
-    # Actualmente fuera
-    st.subheader("Tanques actualmente fuera")
-    tanks = get_all_tanks()
-    fuera = [t for t in tanks if t.status == "out"]
-    df_out = pd.DataFrame(
-        [{
-            "Serie": t.serial,
-            "Estado": "fuera",
-            "Desde": t.last_movement_date
-        } for t in fuera]
-    )
-    if not df_out.empty and "Desde" in df_out.columns:
-        df_out["Desde"] = pd.to_datetime(df_out["Desde"])
-    st.dataframe(df_out, use_container_width=True)
+def seed_tanks(serials: list[str]):
+    """Create tanks if not present. Safe to call every startup."""
+    session = SessionLocal()
+    try:
+        for s in serials:
+            if not session.get(Tank, s):
+                session.add(Tank(serial=s, status="in", last_movement_date=None))
+        session.commit()
+    finally:
+        session.close()
 
-    # Resumen por Ingeniero
-    st.subheader("Resumen por Ingeniero (tanques actualmente fuera)")
-    resumen = summary_current_out_by_engineer()
-    df_sum = pd.DataFrame(resumen)
-    if df_sum.empty:
-        st.info("No hay tanques fuera actualmente.")
-    else:
-        df_sum = df_sum.rename(columns={"responsible_engineer": "Ingeniero", "count": "Tanques fuera"})
-        st.dataframe(df_sum, use_container_width=True)
+# ----------------- Queries / Actions -----------------
+def get_all_tanks():
+    session = SessionLocal()
+    try:
+        return session.query(Tank).order_by(Tank.serial).all()
+    finally:
+        session.close()
 
-# ========= App (gates por login) =========
-if not st.session_state["auth_ok"]:
-    # Público: solo Reportes + caja de Login
-    login_box()
-    tabs = st.tabs(["📊 Reportes", "🔐 Acceso"])
-    with tabs[0]:
-        render_reportes()
-    with tabs[1]:
-        st.write("Use la barra lateral para iniciar sesión y acceder al resto del sistema.")
-else:
-    # Autenticado: todas las pestañas
-    with st.sidebar:
-        st.caption(f"Conectado como: **{st.session_state['auth_user']}**")
-        if st.button("Cerrar sesión"):
-            logout()
+def get_movements(serial: Optional[str] = None):
+    session = SessionLocal()
+    try:
+        q = session.query(Movement)
+        if serial:
+            q = q.filter(Movement.serial == serial)
+        return q.order_by(Movement.movement_date.desc(), Movement.id.desc()).all()
+    finally:
+        session.close()
 
-    tabs = st.tabs(["📦 Tanques", "✈️ Nuevo Movimiento", "📜 Bitácora", "📊 Reportes"])
+def _validate_smt_required_5_digits(smt_number: Optional[str]) -> str:
+    smt = (smt_number or "").strip()
+    if not re.fullmatch(r"\d{5}", smt):
+        raise ValueError("El Número de SMT es obligatorio y debe tener exactamente 5 dígitos.")
+    return smt
 
-    # ----- Tanques -----
-    with tabs[0]:
-        st.header("Inventario de tanques")
-        tanks = get_all_tanks()
-        df_tanks = pd.DataFrame(
-            [{
-                "Serie": t.serial,
-                "Estado": "fuera" if t.status == "out" else "en almacén",
-                "Último movimiento": t.last_movement_date
-            } for t in tanks]
+def create_movement(
+    serial: str,
+    movement_type: str,               # 'dispatch' | 'receipt'
+    movement_date: date,
+    project: Optional[str] = None,
+    engineer: Optional[str] = None,
+    contractor: Optional[str] = None,
+    smt_number: Optional[str] = None,
+):
+    session = SessionLocal()
+    try:
+        tank = session.get(Tank, serial)
+        if not tank:
+            raise ValueError(f"El tanque {serial} no existe")
+
+        if movement_date > date.today():
+            raise ValueError("La fecha del movimiento no puede estar en el futuro")
+
+        smt_str = _validate_smt_required_5_digits(smt_number)
+
+        if movement_type == "dispatch":
+            if tank.status == "out":
+                raise ValueError("El tanque ya está fuera: no se puede despachar de nuevo")
+            if not project or not engineer or not contractor:
+                raise ValueError("Despacho requiere Proyecto, Ingeniero responsable y Contratista responsable")
+            tank.status = "out"
+        elif movement_type == "receipt":
+            if tank.status == "in":
+                raise ValueError("El tanque ya está en almacén: no se puede recepcionar")
+        else:
+            raise ValueError("Tipo de movimiento inválido")
+
+        tank.last_movement_date = movement_date
+
+        move = Movement(
+            serial=serial,
+            movement_type=movement_type,
+            movement_date=movement_date,
+            project=project or None,
+            responsible_engineer=engineer or None,
+            responsible_contractor=contractor or None,
+            smt_number=smt_str,
         )
-        if not df_tanks.empty and "Último movimiento" in df_tanks.columns:
-            df_tanks["Último movimiento"] = pd.to_datetime(df_tanks["Último movimiento"])
-        st.dataframe(df_tanks, use_container_width=True)
+        session.add(move)
+        session.commit()
+        return move
+    finally:
+        session.close()
 
-    # ----- Nuevo Movimiento -----
-    with tabs[1]:
-        st.header("Registrar movimiento")
-
-        tanks = get_all_tanks()
-        seriales = [t.serial for t in tanks] or SERIALES_PERSONALIZADOS
-
-        col1, col2 = st.columns(2)
-        with col1:
-            serial = st.selectbox("Serie del tanque", seriales, placeholder="Selecciona un tanque")
-            movimiento_ui = st.radio("Tipo de movimiento", MOVIMIENTO_UI, horizontal=True)
-            movimiento_tipo = MOVIMIENTO_MAP[movimiento_ui]
-            fecha_mov = st.date_input("Fecha del movimiento", date.today(), max_value=date.today())
-            proyecto = st.text_input("Proyecto (obligatorio en despacho)", placeholder="Proyecto Atlas")
-            smt = st.text_input("Número de SMT (obligatorio, 5 dígitos)", placeholder="12345")
-        with col2:
-            ing_sel = st.selectbox("Ingeniero responsable (obligatorio en despacho)", INGENIEROS)
-            ing_otro = ""
-            if ing_sel == "Otro":
-                ing_otro = st.text_input("Especifica otro Ingeniero responsable")
-            contratista = st.text_input("Contratista responsable (obligatorio en despacho)", placeholder="ACME Maintenance")
-
-        def _smt_valido(s: str) -> bool:
-            s = (s or "").strip()
-            return s.isdigit() and len(s) == 5
-
-        def _ingeniero_final() -> str | None:
-            if ing_sel == "Otro":
-                return (ing_otro or "").strip() or None
-            return ing_sel
-
-        if st.button("Guardar movimiento", type="primary"):
-            if not serial:
-                st.error("Selecciona un tanque.")
-            elif not _smt_valido(smt):
-                st.error("El Número de SMT es obligatorio y debe tener exactamente 5 dígitos.")
-            elif movimiento_tipo == "dispatch" and (not proyecto.strip() or not _ingeniero_final() or not contratista.strip()):
-                st.error("Despacho requiere Proyecto, Ingeniero responsable y Contratista responsable.")
-            else:
-                try:
-                    mov = create_movement(
-                        serial=serial,
-                        movement_type=movimiento_tipo,
-                        movement_date=fecha_mov,
-                        project=proyecto or None,
-                        engineer=_ingeniero_final(),
-                        contractor=contratista or None,
-                        smt_number=smt.strip(),
-                    )
-                    st.success(f"Movimiento registrado: {serial} — {movimiento_ui.lower()} — {fecha_mov.isoformat()}")
-                except Exception as e:
-                    st.error(str(e))
-
-    # ----- Bitácora -----
-    with tabs[2]:
-        st.header("Bitácora de movimientos")
-
-        tanks = get_all_tanks()
-        filtro_serial = st.selectbox("Filtrar por tanque", ["Todos"] + [t.serial for t in tanks])
-
-        movimientos = get_movements(None if filtro_serial == "Todos" else filtro_serial)
-        df_log = pd.DataFrame(
-            [{
-                "ID": m.id,
-                "Serie": m.serial,
-                "Tipo": "Despacho" if m.movement_type == "dispatch" else "Recepción",
-                "Fecha": m.movement_date,
-                "Proyecto": m.project,
-                "Ingeniero": m.responsible_engineer,
-                "Contratista": getattr(m, "responsible_contractor", None),
-                "SMT": getattr(m, "smt_number", None),
-                "Creado": m.created_at,
-            } for m in movimientos]
-        )
-        if not df_log.empty:
-            for c in ["Fecha", "Creado"]:
-                if c in df_log.columns:
-                    df_log[c] = pd.to_datetime(df_log[c])
-        st.dataframe(df_log, use_container_width=True, height=420)
-
-    # ----- Reportes -----
-    with tabs[3]:
-        render_reportes()
+def summary_current_out_by_engineer() -> List[Dict[str, str | int]]:
+    session = SessionLocal()
+    try:
+        out_tanks = session.query(Tank).filter(Tank.status == "out").all()
+        counts: Dict[str, int] = {}
+        for t in out_tanks:
+            last = (
+                session.query(Movement)
+                .filter(Movement.serial == t.serial)
+                .order_by(Movement.movement_date.desc(), Movement.id.desc())
+                .first()
+            )
+            if last and last.movement_type == "dispatch":
+                eng = last.responsible_engineer or "(sin ingeniero)"
+                counts[eng] = counts.get(eng, 0) + 1
+        return [{"responsible_engineer": k, "count": v} for k, v in sorted(counts.items(), key=lambda x: (-x[1], x[0]))]
+    finally:
+        session.close()
