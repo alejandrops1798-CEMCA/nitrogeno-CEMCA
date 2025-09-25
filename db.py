@@ -1,22 +1,59 @@
-# db.py
+# db.py — Soporta Postgres (Neon) vía DATABASE_URL y hace fallback a SQLite local.
 from __future__ import annotations
 from datetime import date, datetime
-import re
+import os, re
 from typing import Optional, List, Dict
 from sqlalchemy import (
     create_engine, Column, String, Integer, Date, DateTime, ForeignKey, text
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
-Base = declarative_base()
-engine = create_engine("sqlite:///tanks.db", echo=False, future=True)
+# ----------------- Resolución de URL de base de datos -----------------
+def _database_url() -> str:
+    """
+    Prioridad:
+    1) st.secrets["DATABASE_URL"] (Cloud / producción)
+    2) os.environ["DATABASE_URL"] (desarrollo)
+    3) "sqlite:///tanks.db" (solo local)
+
+    Guardrail: en Streamlit Cloud, si falta DATABASE_URL, fallar en vez de
+    caer silenciosamente a SQLite (para evitar pérdida de datos).
+    """
+    url = None
+    in_cloud = os.getenv("STREAMLIT_RUNTIME", "").lower() == "cloud"
+    try:
+        import streamlit as st
+        if hasattr(st, "secrets"):
+            url = st.secrets.get("DATABASE_URL")
+    except Exception:
+        pass
+
+    url = url or os.getenv("DATABASE_URL")
+
+    if in_cloud and not url:
+        raise RuntimeError(
+            "DATABASE_URL no está configurado en Streamlit Cloud Secrets. "
+            "Se rechaza usar SQLite en producción para evitar pérdida de datos."
+        )
+
+    return url or "sqlite:///tanks.db"
+
+DATABASE_URL = _database_url()
+
+engine = create_engine(
+    DATABASE_URL,
+    echo=False,
+    future=True,
+    pool_pre_ping=True,
+)
 SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
 
 # ----------------- Tablas -----------------
 class Tank(Base):
     __tablename__ = "tanks"
     serial = Column(String, primary_key=True)
-    status = Column(String, default="in")                 # 'in' | 'out'
+    status = Column(String, default="in")  # 'in' | 'out'
     last_movement_date = Column(Date, nullable=True)
     movements = relationship("Movement", back_populates="tank", cascade="all, delete-orphan")
 
@@ -41,20 +78,35 @@ def init_db():
     _ensure_migrations()
 
 def _ensure_migrations():
-    """Agrega columnas nuevas si faltan (para DB existentes)."""
+    """Agrega columnas nuevas si faltan (SQLite y Postgres)."""
     with engine.begin() as conn:
-        def has_col(table: str, col: str) -> bool:
+        url_str = str(engine.url)
+
+        def has_col_sqlite(table: str, col: str) -> bool:
             rows = conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
-            # (cid, name, type, notnull, dflt_value, pk)
             return any(r[1] == col for r in rows)
+
+        def has_col_postgres(table: str, col: str) -> bool:
+            q = text("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = :t AND table_schema = 'public'
+            """)
+            rows = conn.execute(q, {"t": table}).fetchall()
+            return any(r[0] == col for r in rows)
+
+        def has_col(table: str, col: str) -> bool:
+            if url_str.startswith("sqlite"):
+                return has_col_sqlite(table, col)
+            else:
+                return has_col_postgres(table, col)
 
         if not has_col("movements", "responsible_contractor"):
             conn.execute(text("ALTER TABLE movements ADD COLUMN responsible_contractor TEXT"))
         if not has_col("movements", "smt_number"):
             conn.execute(text("ALTER TABLE movements ADD COLUMN smt_number TEXT"))
 
-def seed_tanks(serials: list[str]):
-    """Crea tanques si no existen (no duplica)."""
+def seed_tanks(serials: List[str]):
+    """Crea tanques si no existen (idempotente)."""
     session = SessionLocal()
     try:
         for s in serials:
@@ -99,10 +151,10 @@ def create_movement(
     smt_number: Optional[str] = None,
 ):
     """
-    Crea un movimiento aplicando reglas de negocio:
+    Reglas:
     - SMT obligatorio (5 dígitos) para cualquier movimiento
-    - No se puede despachar si el tanque ya está 'out'
-    - No se puede recepcionar si el tanque ya está 'in'
+    - No despachar si el tanque ya está 'out'
+    - No recepcionar si el tanque ya está 'in'
     - En 'dispatch' se requieren: project, engineer, contractor
     - Fecha futura no permitida
     """
@@ -127,7 +179,8 @@ def create_movement(
         elif movement_type == "receipt":
             if tank.status == "in":
                 raise ValueError("El tanque ya está en almacén: no se puede recepcionar")
-            # En recepción, project/engineer/contractor pueden venir o no.
+            # ✅ Corrección clave: al recepcionar, el tanque vuelve a 'in'
+            tank.status = "in"
 
         else:
             raise ValueError("Tipo de movimiento inválido")
@@ -142,6 +195,7 @@ def create_movement(
             responsible_engineer=engineer or None,
             responsible_contractor=contractor or None,
             smt_number=smt_str,
+            updated_at=datetime.utcnow(),
         )
         session.add(move)
         session.commit()
@@ -150,10 +204,7 @@ def create_movement(
         session.close()
 
 def summary_current_out_by_engineer() -> List[Dict[str, str | int]]:
-    """
-    Devuelve lista de dicts con el conteo de tanques actualmente 'out' por ingeniero responsable:
-    [{'responsible_engineer': 'Nombre', 'count': 3}, ...]
-    """
+    """Conteo de tanques actualmente 'out' por ingeniero responsable."""
     session = SessionLocal()
     try:
         out_tanks = session.query(Tank).filter(Tank.status == "out").all()

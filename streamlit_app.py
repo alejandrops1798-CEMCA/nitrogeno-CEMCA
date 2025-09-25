@@ -1,4 +1,4 @@
-# streamlit_app.py (ES, con Login corregido y Reportes público)
+# streamlit_app.py (ES, con Login y Reportes público)
 from __future__ import annotations
 import streamlit as st
 import pandas as pd
@@ -13,7 +13,7 @@ from db import (
 )
 import os
 
-# Show which database is being used
+# Mostrar qué DB se usa
 db_url = os.getenv("DATABASE_URL", "sqlite:///tanks.db")
 st.caption("🔗 DB: Neon Postgres" if db_url.startswith("postgresql") else "💾 DB: SQLite")
 
@@ -25,19 +25,9 @@ MOVIMIENTO_UI = ["Despacho", "Recepción"]
 MOVIMIENTO_MAP = {"Despacho": "dispatch", "Recepción": "receipt"}
 
 INGENIEROS = [
-    "Victor de Leon",
-    "Pablo Castillo",
-    "Roberto de Jesus",
-    "Rayner Drullard",
-    "Lenny Ramirez",
-    "Fausto Huerta",
-    "Alfredo Matos",
-    "Luilly Lima",
-    "Fantino Suarez",
-    "Jhonatan Perez",
-    "Sarah Bonilla",
-    "Julian Barcelo",
-    "Otro",
+    "Victor de Leon", "Pablo Castillo", "Roberto de Jesus", "Rayner Drullard",
+    "Lenny Ramirez", "Fausto Huerta", "Alfredo Matos", "Luilly Lima",
+    "Fantino Suarez", "Jhonatan Perez", "Sarah Bonilla", "Julian Barcelo", "Otro",
 ]
 
 SERIALES_PERSONALIZADOS = [
@@ -95,11 +85,7 @@ def render_reportes():
     tanks = get_all_tanks()
     fuera = [t for t in tanks if t.status == "out"]
     df_out = pd.DataFrame(
-        [{
-            "Serie": t.serial,
-            "Estado": "fuera",
-            "Desde": t.last_movement_date
-        } for t in fuera]
+        [{"Serie": t.serial, "Estado": "fuera", "Desde": t.last_movement_date} for t in fuera]
     )
     if not df_out.empty and "Desde" in df_out.columns:
         df_out["Desde"] = pd.to_datetime(df_out["Desde"])
@@ -198,6 +184,8 @@ else:
                         smt_number=smt.strip(),
                     )
                     st.success(f"Movimiento registrado: {serial} — {movimiento_ui.lower()} — {fecha_mov.isoformat()}")
+                    # ✅ Forzar refresco de todas las tablas/reportes
+                    st.rerun()
                 except Exception as e:
                     st.error(str(e))
 
