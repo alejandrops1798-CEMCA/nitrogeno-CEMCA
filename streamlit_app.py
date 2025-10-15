@@ -1,8 +1,9 @@
-# streamlit_app.py (ES, con Login y Reportes público)
 from __future__ import annotations
 import streamlit as st
 import pandas as pd
 from datetime import date
+import re
+import os
 from db import (
     init_db,
     seed_tanks,
@@ -11,7 +12,6 @@ from db import (
     create_movement,
     summary_current_out_by_engineer,
 )
-import os
 
 # Mostrar qué DB se usa
 db_url = os.getenv("DATABASE_URL", "sqlite:///tanks.db")
@@ -32,6 +32,8 @@ INGENIEROS = [
 
 SERIALES_PERSONALIZADOS = [
     "AIRLIQUIDE-1","AIRLIQUIDE-2","AIRLIQUIDE-3","AIRLIQUIDE-4","AIRLIQUIDE-5",
+    "AIRLIQUIDE-6","AIRLIQUIDE-7","AIRLIQUIDE-8","AIRLIQUIDE-9",
+    "GC-ACETILENO-1","GC-OXYGENO-1",
     "GC-TAZUL-01","GC-TAZUL-02","GC-TAZUL-03","GC-TAZUL-04","GC-TAZUL-05",
     "GC-TAZUL-06","GC-TAZUL-07","GC-TAZUL-08","GC-TAZUL-09","GC-TAZUL-10",
     "GC-TAZUL-11","GC-TAZUL-12","GC-TAZUL-13","GC-TAZUL-14","GC-TAZUL-15",
@@ -43,8 +45,14 @@ SERIALES_PERSONALIZADOS = [
 st.set_page_config(page_title="Seguimiento de Tanques de Nitrógeno", layout="wide")
 st.title("🌡️ Seguimiento de Tanques de Nitrógeno")
 
+import os, time
+st.info("Versión UI: 2025-10-14-03 • Login activo: "
+        + ("✅" if st.session_state.get("auth_ok") else "❌")
+        + " • DB: "
+        + ("Neon" if os.getenv("DATABASE_URL","").startswith("postgresql") else "SQLite")
+        + " • Build: " + time.strftime("%H:%M:%S"))
+
 init_db()
-# (Si no quieres re-sembrar en cada arranque, comenta esta línea.)
 seed_tanks(SERIALES_PERSONALIZADOS)
 
 # ========= Estado de sesión (auth) =========
@@ -61,7 +69,34 @@ def logout():
     st.session_state["auth_user"] = None
     st.rerun()
 
-# ========= UI de Login (si no autenticado) =========
+# ========= Reportes =========
+def render_reportes():
+    st.header("Reportes")
+
+    tanks = get_all_tanks()
+    fuera = [t for t in tanks if t.status == "out"]
+
+    total_fuera = len(fuera)
+    total_tanques = len(tanks)
+    resumen = summary_current_out_by_engineer()
+
+    st.subheader(f"Resumen por Ingeniero — {total_fuera}/{total_tanques}")
+    df_sum = pd.DataFrame(resumen)
+    if df_sum.empty:
+        st.info("No hay tanques fuera actualmente.")
+    else:
+        df_sum = df_sum.rename(columns={"responsible_engineer": "Ingeniero", "count": "Tanques fuera"})
+        st.dataframe(df_sum, use_container_width=True)
+
+    st.subheader("Listado de tanques actualmente fuera")
+    df_out = pd.DataFrame(
+        [{"Serie": t.serial, "Estado": "fuera", "Desde": t.last_movement_date} for t in fuera]
+    )
+    if not df_out.empty and "Desde" in df_out.columns:
+        df_out["Desde"] = pd.to_datetime(df_out["Desde"])
+    st.dataframe(df_out, use_container_width=True)
+
+# ========= UI de Login =========
 def login_box():
     with st.sidebar:
         st.subheader("🔐 Acceso")
@@ -76,34 +111,8 @@ def login_box():
             else:
                 st.error("Credenciales inválidas.")
 
-# ========= Contenido de Reportes (siempre visible) =========
-def render_reportes():
-    st.header("Reportes")
-
-    # Actualmente fuera
-    st.subheader("Tanques actualmente fuera")
-    tanks = get_all_tanks()
-    fuera = [t for t in tanks if t.status == "out"]
-    df_out = pd.DataFrame(
-        [{"Serie": t.serial, "Estado": "fuera", "Desde": t.last_movement_date} for t in fuera]
-    )
-    if not df_out.empty and "Desde" in df_out.columns:
-        df_out["Desde"] = pd.to_datetime(df_out["Desde"])
-    st.dataframe(df_out, use_container_width=True)
-
-    # Resumen por Ingeniero
-    st.subheader("Resumen por Ingeniero (tanques actualmente fuera)")
-    resumen = summary_current_out_by_engineer()
-    df_sum = pd.DataFrame(resumen)
-    if df_sum.empty:
-        st.info("No hay tanques fuera actualmente.")
-    else:
-        df_sum = df_sum.rename(columns={"responsible_engineer": "Ingeniero", "count": "Tanques fuera"})
-        st.dataframe(df_sum, use_container_width=True)
-
-# ========= App (gates por login) =========
+# ========= App (solo accesos válidos) =========
 if not st.session_state["auth_ok"]:
-    # Público: solo Reportes + caja de Login
     login_box()
     tabs = st.tabs(["📊 Reportes", "🔐 Acceso"])
     with tabs[0]:
@@ -111,7 +120,6 @@ if not st.session_state["auth_ok"]:
     with tabs[1]:
         st.write("Use la barra lateral para iniciar sesión y acceder al resto del sistema.")
 else:
-    # Autenticado: todas las pestañas
     with st.sidebar:
         st.caption(f"Conectado como: **{st.session_state['auth_user']}**")
         if st.button("Cerrar sesión"):
@@ -122,6 +130,37 @@ else:
     # ----- Tanques -----
     with tabs[0]:
         st.header("Inventario de tanques")
+
+        # ➕ Agregar tanques (solo visible tras login)
+        with st.expander("➕ Agregar tanque(s)", expanded=False):
+            st.caption("Solo letras mayúsculas (A–Z), números (0–9) y guiones (-).")
+            st.caption("Puedes pegar varios: **uno por línea** o **separados por coma (,)**.")
+            entrada = st.text_area("Nuevos números de serie", height=120, placeholder="GC-NUEVO-01\nGC-NUEVO-02, GC-NUEVO-03")
+
+            if st.button("Agregar", type="primary"):
+                raw = (entrada or "").replace("\n", ",")
+                nuevos = [s.strip().upper() for s in raw.split(",") if s.strip()]
+                if not nuevos:
+                    st.warning("Ingrese al menos un número de serie.")
+                else:
+                    # Validar formato permitido
+                    invalidos = [s for s in nuevos if not re.fullmatch(r"[A-Z0-9-]+", s)]
+                    if invalidos:
+                        st.error(f"Formato inválido en: {', '.join(invalidos)}. Solo letras mayúsculas, números y guiones.")
+                    else:
+                        nuevos_unicos = list(dict.fromkeys(nuevos))
+                        existentes = {t.serial for t in get_all_tanks()}
+                        ya_existen = [s for s in nuevos_unicos if s in existentes]
+                        a_crear = [s for s in nuevos_unicos if s not in existentes]
+
+                        if a_crear:
+                            seed_tanks(a_crear)
+                            st.success(f"Agregados: {', '.join(a_crear)}")
+                        if ya_existen:
+                            st.info(f"Ya existían y no se duplicaron: {', '.join(ya_existen)}")
+                        st.rerun()
+
+        # Tabla de inventario
         tanks = get_all_tanks()
         df_tanks = pd.DataFrame(
             [{
@@ -184,7 +223,6 @@ else:
                         smt_number=smt.strip(),
                     )
                     st.success(f"Movimiento registrado: {serial} — {movimiento_ui.lower()} — {fecha_mov.isoformat()}")
-                    # ✅ Forzar refresco de todas las tablas/reportes
                     st.rerun()
                 except Exception as e:
                     st.error(str(e))

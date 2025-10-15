@@ -8,17 +8,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
-# ----------------- Resolución de URL de base de datos -----------------
 def _database_url() -> str:
-    """
-    Prioridad:
-    1) st.secrets["DATABASE_URL"] (Cloud / producción)
-    2) os.environ["DATABASE_URL"] (desarrollo)
-    3) "sqlite:///tanks.db" (solo local)
-
-    Guardrail: en Streamlit Cloud, si falta DATABASE_URL, fallar en vez de
-    caer silenciosamente a SQLite (para evitar pérdida de datos).
-    """
     url = None
     in_cloud = os.getenv("STREAMLIT_RUNTIME", "").lower() == "cloud"
     try:
@@ -27,15 +17,12 @@ def _database_url() -> str:
             url = st.secrets.get("DATABASE_URL")
     except Exception:
         pass
-
     url = url or os.getenv("DATABASE_URL")
-
     if in_cloud and not url:
         raise RuntimeError(
             "DATABASE_URL no está configurado en Streamlit Cloud Secrets. "
             "Se rechaza usar SQLite en producción para evitar pérdida de datos."
         )
-
     return url or "sqlite:///tanks.db"
 
 DATABASE_URL = _database_url()
@@ -49,7 +36,6 @@ engine = create_engine(
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
-# ----------------- Tablas -----------------
 class Tank(Base):
     __tablename__ = "tanks"
     serial = Column(String, primary_key=True)
@@ -66,19 +52,16 @@ class Movement(Base):
     project = Column(String, nullable=True)
     responsible_engineer = Column(String, nullable=True)
     responsible_contractor = Column(String, nullable=True)
-    smt_number = Column(String, nullable=True)            # obligatorio (5 dígitos, validado en create_movement)
+    smt_number = Column(String, nullable=True)            # validado en create_movement
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     tank = relationship("Tank", back_populates="movements")
 
-# ----------------- Setup + Migración -----------------
 def init_db():
-    """Crea tablas si no existen y asegura columnas nuevas en DB antiguas."""
     Base.metadata.create_all(engine)
     _ensure_migrations()
 
 def _ensure_migrations():
-    """Agrega columnas nuevas si faltan (SQLite y Postgres)."""
     with engine.begin() as conn:
         url_str = str(engine.url)
 
@@ -106,7 +89,6 @@ def _ensure_migrations():
             conn.execute(text("ALTER TABLE movements ADD COLUMN smt_number TEXT"))
 
 def seed_tanks(serials: List[str]):
-    """Crea tanques si no existen (idempotente)."""
     session = SessionLocal()
     try:
         for s in serials:
@@ -116,7 +98,6 @@ def seed_tanks(serials: List[str]):
     finally:
         session.close()
 
-# ----------------- Consultas/Acciones -----------------
 def get_all_tanks():
     session = SessionLocal()
     try:
@@ -135,7 +116,6 @@ def get_movements(serial: Optional[str] = None):
         session.close()
 
 def _validate_smt_required_5_digits(smt_number: Optional[str]) -> str:
-    """SMT es obligatorio y debe tener exactamente 5 dígitos."""
     smt = (smt_number or "").strip()
     if not re.fullmatch(r"\d{5}", smt):
         raise ValueError("El Número de SMT es obligatorio y debe tener exactamente 5 dígitos.")
@@ -152,7 +132,7 @@ def create_movement(
 ):
     """
     Reglas:
-    - SMT obligatorio (5 dígitos) para cualquier movimiento
+    - SMT obligatorio (5 dígitos)
     - No despachar si el tanque ya está 'out'
     - No recepcionar si el tanque ya está 'in'
     - En 'dispatch' se requieren: project, engineer, contractor
@@ -179,7 +159,6 @@ def create_movement(
         elif movement_type == "receipt":
             if tank.status == "in":
                 raise ValueError("El tanque ya está en almacén: no se puede recepcionar")
-            # ✅ Corrección clave: al recepcionar, el tanque vuelve a 'in'
             tank.status = "in"
 
         else:
@@ -204,7 +183,7 @@ def create_movement(
         session.close()
 
 def summary_current_out_by_engineer() -> List[Dict[str, str | int]]:
-    """Conteo de tanques actualmente 'out' por ingeniero responsable."""
+    """Conteo de tanques actualmente 'out' por ingeniero del ÚLTIMO despacho."""
     session = SessionLocal()
     try:
         out_tanks = session.query(Tank).filter(Tank.status == "out").all()
@@ -223,5 +202,37 @@ def summary_current_out_by_engineer() -> List[Dict[str, str | int]]:
             {"responsible_engineer": k, "count": v}
             for k, v in sorted(counts.items(), key=lambda x: (-x[1], x[0]))
         ]
+    finally:
+        session.close()
+
+# ========= NUEVO: Reparar estados según historial =========
+def recompute_tank_states_from_history() -> int:
+    """
+    Recorre cada tanque, busca su último movimiento y ajusta:
+      - Tank.status = 'out' si el último movimiento fue 'dispatch', si no 'in'
+      - Tank.last_movement_date = fecha del último movimiento
+    Devuelve la cantidad de tanques actualizados.
+    """
+    session = SessionLocal()
+    updated = 0
+    try:
+        tanks = session.query(Tank).all()
+        for t in tanks:
+            last = (
+                session.query(Movement)
+                .filter(Movement.serial == t.serial)
+                .order_by(Movement.movement_date.desc(), Movement.id.desc())
+                .first()
+            )
+            if not last:
+                continue
+            new_status = "out" if last.movement_type == "dispatch" else "in"
+            new_date = last.movement_date
+            if t.status != new_status or t.last_movement_date != new_date:
+                t.status = new_status
+                t.last_movement_date = new_date
+                updated += 1
+        session.commit()
+        return updated
     finally:
         session.close()
