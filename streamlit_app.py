@@ -11,10 +11,11 @@ from db import (
     get_movements,
     create_movement,
     summary_current_out_by_engineer,
+    DATABASE_URL,
 )
 
 # Mostrar qué DB se usa
-db_url = os.getenv("DATABASE_URL", "sqlite:///tanks.db")
+db_url = DATABASE_URL
 st.caption("🔗 DB: Neon Postgres" if db_url.startswith("postgresql") else "💾 DB: SQLite")
 
 # ========= Config =========
@@ -45,15 +46,20 @@ SERIALES_PERSONALIZADOS = [
 st.set_page_config(page_title="Seguimiento de Tanques de Nitrógeno", layout="wide")
 st.title("🌡️ Seguimiento de Tanques de Nitrógeno")
 
-import os, time
+import time
 st.info("Versión UI: 2025-10-14-03 • Login activo: "
         + ("✅" if st.session_state.get("auth_ok") else "❌")
         + " • DB: "
         + ("Neon" if os.getenv("DATABASE_URL","").startswith("postgresql") else "SQLite")
         + " • Build: " + time.strftime("%H:%M:%S"))
 
-init_db()
-seed_tanks(SERIALES_PERSONALIZADOS)
+@st.cache_resource(show_spinner="Inicializando base de datos…")
+def _startup() -> bool:
+    init_db()
+    seed_tanks(SERIALES_PERSONALIZADOS)
+    return True
+
+_startup()
 
 # ========= Estado de sesión (auth) =========
 if "auth_ok" not in st.session_state:
