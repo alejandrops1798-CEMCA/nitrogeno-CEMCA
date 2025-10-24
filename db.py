@@ -7,6 +7,7 @@ from sqlalchemy import (
     create_engine, Column, String, Integer, Date, DateTime, ForeignKey, text
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+from sqlalchemy.engine import make_url
 
 def _database_url() -> str:
     url = None
@@ -25,7 +26,27 @@ def _database_url() -> str:
         )
     return url or "sqlite:///tanks.db"
 
-DATABASE_URL = _database_url()
+def _normalize_database_url(url: str) -> str:
+    """Ensure SSL is enforced for Postgres URLs while leaving others intact."""
+
+    try:
+        parsed = make_url(url)
+    except Exception:
+        return url
+
+    if parsed.drivername.startswith("postgresql"):
+        query = dict(parsed.query)
+        if "sslmode" not in query:
+            query["sslmode"] = "require"
+            parsed = parsed.set(query=query)
+
+        return str(parsed)
+
+    return url
+
+
+DATABASE_URL = _normalize_database_url(_database_url())
+
 
 engine = create_engine(
     DATABASE_URL,
